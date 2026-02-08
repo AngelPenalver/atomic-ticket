@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import { CancelExpiredPaymentsUseCase } from 'src/payments/application/use-cases/cancel-expired-payments.use-case';
 
 @Injectable()

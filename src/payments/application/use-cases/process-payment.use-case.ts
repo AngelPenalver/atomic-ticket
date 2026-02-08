@@ -1,4 +1,4 @@
-import { Inject, Logger } from "@nestjs/common";
+import { ConflictException, Inject, Logger, NotFoundException } from "@nestjs/common";
 import { Payment } from "src/payments/domain/entities/payment.entity";
 import type { IPaymentGateway } from "../ports/payment-gateway.interface";
 import type { IPaymentRepository } from "src/payments/domain/repositories/payment.repository.interface";
@@ -21,7 +21,7 @@ export class ProcessPaymentUseCase {
 
         if (!payment) {
             const order = await this.orderRepository.findOneBy({ id: orderId });
-            if (!order) throw new Error('Order not found');
+            if (!order) throw new NotFoundException('Order not found');
 
             payment = new Payment(
                 crypto.randomUUID(),
@@ -35,7 +35,7 @@ export class ProcessPaymentUseCase {
         }
 
         if (payment.status === 'PAID') {
-            throw new Error('This order is already paid');
+            throw new ConflictException('This order is already paid');
         }
 
         try {
