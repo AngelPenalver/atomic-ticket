@@ -268,10 +268,16 @@ pnpm test:cov
 ### Eventos
 - `POST /api/v1/events` - Crear evento con asientos
 
+### Asientos
+- `GET /api/v1/seats/event/:event_id` - Obtener todos los asientos de un evento
+- `GET /api/v1/seats/:seat_id` - Obtener detalle de un asiento
+
 ### Órdenes
 - `POST /api/v1/orders/:seat_id/book` - Reservar asiento
   - Body (opcional): `{ "user_id": "uuid" }`
   - Si no se proporciona `user_id`, se genera uno aleatorio
+- `GET /api/v1/orders` - Listar todas las órdenes
+- `GET /api/v1/orders/:order_id` - Obtener detalle de una orden
 
 ### Pagos
 - `POST /api/v1/payments/process` - Procesar pago manualmente
