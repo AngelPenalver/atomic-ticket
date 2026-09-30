@@ -1,28 +1,50 @@
-import { Inject, Logger } from "@nestjs/common";
-import type { IPaymentRepository } from "src/payments/domain/repositories/payment.repository.interface";
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { PAYMENT_GATEWAY } from '../ports/payment-gateway.interface';
+import type { IPaymentGateway } from '../ports/payment-gateway.interface';
+import { RESERVATION_PORT } from '../ports/reservation.port';
+import type { IReservationPort } from '../ports/reservation.port';
 
+const BATCH_SIZE = 100;
+
+/** Libera las reservas caducadas, cerrando antes su checkout. */
+@Injectable()
 export class CancelExpiredPaymentsUseCase {
-    private readonly logger = new Logger(CancelExpiredPaymentsUseCase.name);
-    constructor(
-        @Inject('IPaymentRepository')
-        private readonly paymentRepository: IPaymentRepository
-    ) { }
+  private readonly logger = new Logger(CancelExpiredPaymentsUseCase.name);
 
-    async execute(): Promise<void> {
-        const expirationTime = new Date();
-        expirationTime.setMinutes(expirationTime.getMinutes() - 10);
+  constructor(
+    @Inject(RESERVATION_PORT) private readonly reservations: IReservationPort,
+    @Inject(PAYMENT_GATEWAY) private readonly paymentGateway: IPaymentGateway,
+  ) {}
 
-        const expiredPayments = await this.paymentRepository.findExpiredPayments(expirationTime);
+  async execute(now = new Date()): Promise<void> {
+    const expired = await this.reservations.findExpiredPendingOrders(
+      now,
+      BATCH_SIZE,
+    );
 
-        if (expiredPayments.length === 0) return;
-
-        for (const payment of expiredPayments) {
-            try {
-                await this.paymentRepository.cancelExpiredPayment(payment.orderId);
-                this.logger.warn(`Order ${payment.orderId} cancelled due to expiration.`);
-            } catch (error) {
-                this.logger.error(`Error cancelling order ${payment.orderId}:`, error);
-            }
+    for (const { orderId, externalId } of expired) {
+      try {
+        if (
+          externalId &&
+          (await this.paymentGateway.expireCheckout(externalId)) === 'completed'
+        ) {
+          await this.reservations.markPaid(orderId, externalId);
+          this.logger.log(
+            `Order ${orderId} was paid before expiring; confirmed`,
+          );
+          continue;
         }
+
+        const result = await this.reservations.release(orderId);
+        if (result === 'settled') {
+          this.logger.warn(`Order ${orderId} cancelled due to expiration`);
+        }
+      } catch (error) {
+        this.logger.error(
+          `Error cancelling order ${orderId}`,
+          error instanceof Error ? error.stack : error,
+        );
+      }
     }
+  }
 }

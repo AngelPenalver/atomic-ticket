@@ -1,77 +1,54 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource, Repository } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
 import { CreateEventDto } from './dto/create-event.dto';
 import { Event } from './entities/event.entity';
 import { Seat } from 'src/seats/entities/seat.entity';
-import { InjectRepository } from '@nestjs/typeorm';
 
+const SEATS_PER_ROW = 10;
+const INSERT_CHUNK_SIZE = 1000;
+
+/** Gestiona la creación y consulta de eventos. */
 @Injectable()
 export class EventsService {
   private readonly logger = new Logger(EventsService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     @InjectRepository(Event)
     private readonly eventRepository: Repository<Event>,
-  ) { }
+  ) {}
 
+  /** Crea el evento y genera sus asientos en una única transacción. */
   async create(createEventDto: CreateEventDto) {
+    const savedEvent = await this.dataSource.transaction(async (manager) => {
+      const event = manager.create(Event, {
+        name: createEventDto.name,
+        description: createEventDto.description,
+        date: createEventDto.date,
+        total_tickets: createEventDto.total_tickets,
+      });
+      const saved = await manager.save(event);
 
-    const queryRunner = this.dataSource.createQueryRunner()
-    await queryRunner.connect()
-    await queryRunner.startTransaction()
-
-
-    try {
-
-      const totalTickets = createEventDto.total_tickets;
-      const seatsPerRow = 10;
-      const totalRows = Math.ceil(totalTickets / seatsPerRow);
-
-      let seadCounter = 0;
-
-
-      const event = new Event();
-      event.name = createEventDto.name;
-      event.description = createEventDto.description;
-      event.date = createEventDto.date;
-      event.total_tickets = createEventDto.total_tickets;
-
-      const savedEvent = await queryRunner.manager.save(event);
-
-      const seats: Seat[] = [];
-      for (let row = 1; row <= totalRows; row++) {
-        const rowLabel = String.fromCharCode(64 + row);
-
-        for (let number = 1; number <= seatsPerRow; number++) {
-          if (seadCounter >= totalTickets) break;
-
-          const seat = new Seat();
-          seat.row = rowLabel;
-          seat.number = number;
-          seat.price = createEventDto.price;
-          seat.event = savedEvent;
-
-          seats.push(seat);
-          seadCounter++;
-        }
+      const seats = buildSeats(
+        saved,
+        createEventDto.total_tickets,
+        createEventDto.price,
+      );
+      for (let i = 0; i < seats.length; i += INSERT_CHUNK_SIZE) {
+        await manager.insert(Seat, seats.slice(i, i + INSERT_CHUNK_SIZE));
       }
 
-      while (seats.length > 0) {
-        const chunk = seats.splice(0, 1000);
-        await queryRunner.manager.insert(Seat, chunk);
-      }
+      return saved;
+    });
 
-      await queryRunner.commitTransaction();
-      return event;
-    } catch (error) {
-      await queryRunner.rollbackTransaction();
-      throw error;
-    } finally {
-      await queryRunner.release();
-    }
-
+    this.logger.log(
+      `Event ${savedEvent.id} created with ${createEventDto.total_tickets} seats`,
+    );
+    return savedEvent;
   }
 
+  /** Devuelve un evento por id o lanza NotFoundException. */
   async findOne(id: string) {
     const event = await this.eventRepository.findOneBy({ id });
     if (!event) {
@@ -79,4 +56,27 @@ export class EventsService {
     }
     return event;
   }
+}
+
+/** Genera los asientos del evento repartidos en filas de SEATS_PER_ROW. */
+function buildSeats(
+  event: Event,
+  totalTickets: number,
+  price: number,
+): Partial<Seat>[] {
+  return Array.from({ length: totalTickets }, (_, index) => ({
+    event,
+    row: rowLabel(Math.floor(index / SEATS_PER_ROW)),
+    number: (index % SEATS_PER_ROW) + 1,
+    price,
+  }));
+}
+
+/** Convierte un índice de fila en su etiqueta: 0 → A, 25 → Z, 26 → AA. */
+function rowLabel(rowIndex: number): string {
+  let label = '';
+  for (let n = rowIndex + 1; n > 0; n = Math.floor((n - 1) / 26)) {
+    label = String.fromCharCode(65 + ((n - 1) % 26)) + label;
+  }
+  return label;
 }

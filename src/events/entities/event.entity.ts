@@ -1,29 +1,36 @@
-import { Seat } from "src/seats/entities/seat.entity";
-import { Column, CreateDateColumn, Entity, OneToMany, PrimaryGeneratedColumn, UpdateDateColumn } from "typeorm";
+import { Seat } from 'src/seats/entities/seat.entity';
+import {
+  Column,
+  CreateDateColumn,
+  Entity,
+  OneToMany,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 
 @Entity('event')
 export class Event {
-    @PrimaryGeneratedColumn('uuid')
-    id: string;
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
 
-    @OneToMany(() => Seat, (seat) => seat.event)
-    seats: Seat[];
+  @OneToMany(() => Seat, (seat) => seat.event)
+  seats: Seat[];
 
-    @Column({ type: 'varchar', length: 50 })
-    name: string;
+  @Column({ type: 'varchar', length: 50 })
+  name: string;
 
-    @Column({ type: 'varchar', length: 255 })
-    description: string;
+  @Column({ type: 'varchar', length: 255 })
+  description: string;
 
-    @Column({ type: 'timestamp' })
-    date: Date;
+  @Column({ type: 'timestamptz' })
+  date: Date;
 
-    @Column({ type: 'int' })
-    total_tickets: number;
+  @Column({ type: 'int' })
+  total_tickets: number;
 
-    @CreateDateColumn()
-    created_at: Date;
+  @CreateDateColumn({ type: 'timestamptz' })
+  created_at: Date;
 
-    @UpdateDateColumn()
-    updated_at: Date;
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updated_at: Date;
 }
