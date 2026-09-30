@@ -1,199 +1,189 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { OrdersService } from './orders.service';
-import { DataSource } from 'typeorm';
 import { ConflictException, NotFoundException } from '@nestjs/common';
-import { Seat, STATUS_SEATS } from 'src/seats/entities/seat.entity';
+import { ConfigService } from '@nestjs/config';
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
+import { OrdersService } from './orders.service';
 import { Order, ORDER_STATUS } from './entities/order.entity';
+import { Seat, STATUS_SEATS } from 'src/seats/entities/seat.entity';
 import { ProcessPaymentUseCase } from 'src/payments/application/use-cases/process-payment.use-case';
 
+const TTL_MINUTES = 15;
+
 describe('OrdersService', () => {
-    let service: OrdersService;
-    let dataSource: DataSource;
-    let processPaymentUseCase: ProcessPaymentUseCase;
+  let service: OrdersService;
 
-    const mockQueryRunner = {
-        connect: jest.fn(),
-        startTransaction: jest.fn(),
-        commitTransaction: jest.fn(),
-        rollbackTransaction: jest.fn(),
-        release: jest.fn(),
-        manager: {
-            findOne: jest.fn(),
-            save: jest.fn(),
-            create: jest.fn(),
-        },
-    };
+  const mockManager = {
+    findOne: jest.fn(),
+    create: jest.fn((_entity: unknown, data: object) => ({ ...data })),
+    save: jest.fn(),
+  };
 
-    const mockDataSource = {
-        createQueryRunner: jest.fn().mockReturnValue(mockQueryRunner),
-    };
+  const mockDataSource = {
+    transaction: jest.fn(
+      (work: (manager: typeof mockManager) => Promise<unknown>) =>
+        work(mockManager),
+    ),
+  };
 
-    const mockProcessPaymentUseCase = {
-        execute: jest.fn(),
-    };
+  const mockProcessPaymentUseCase = {
+    execute: jest.fn(),
+  };
 
-    beforeEach(async () => {
-        const module: TestingModule = await Test.createTestingModule({
-            providers: [
-                OrdersService,
-                {
-                    provide: DataSource,
-                    useValue: mockDataSource,
-                },
-                {
-                    provide: ProcessPaymentUseCase,
-                    useValue: mockProcessPaymentUseCase,
-                },
-            ],
-        }).compile();
+  const mockOrderRepository = {
+    findOneBy: jest.fn(),
+    find: jest.fn(),
+  };
 
-        service = module.get<OrdersService>(OrdersService);
-        dataSource = module.get<DataSource>(DataSource);
-        processPaymentUseCase = module.get<ProcessPaymentUseCase>(ProcessPaymentUseCase);
+  const mockConfigService = {
+    getOrThrow: jest.fn().mockReturnValue(TTL_MINUTES),
+  };
 
-        jest.clearAllMocks();
+  const buildSeat = (status = STATUS_SEATS.AVAILABLE): Partial<Seat> => ({
+    id: 'seat-456',
+    status,
+    price: 100,
+    row: 'A',
+    number: 5,
+  });
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    mockManager.save.mockImplementation((entity: object) =>
+      Promise.resolve(
+        'user_id' in entity ? { ...entity, id: 'order-789' } : entity,
+      ),
+    );
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        OrdersService,
+        { provide: DataSource, useValue: mockDataSource },
+        { provide: ProcessPaymentUseCase, useValue: mockProcessPaymentUseCase },
+        { provide: getRepositoryToken(Order), useValue: mockOrderRepository },
+        { provide: ConfigService, useValue: mockConfigService },
+      ],
+    }).compile();
+
+    service = module.get<OrdersService>(OrdersService);
+  });
+
+  describe('createBooking', () => {
+    it('should lock the seat, create a pending order and return the checkout URL', async () => {
+      const seat = buildSeat();
+      mockManager.findOne.mockResolvedValue(seat);
+      mockProcessPaymentUseCase.execute.mockResolvedValue({
+        paymentId: 'payment-123',
+        checkoutUrl: 'https://checkout.stripe.com/pay/cs_test_123',
+      });
+      const before = Date.now();
+
+      const result = await service.createBooking('user-123', 'seat-456');
+
+      expect(mockManager.findOne).toHaveBeenCalledWith(Seat, {
+        where: { id: 'seat-456' },
+        lock: { mode: 'pessimistic_write' },
+      });
+      expect(seat.status).toBe(STATUS_SEATS.LOCKED);
+      expect(mockManager.save).toHaveBeenCalledWith(seat);
+      expect(mockManager.create).toHaveBeenCalledWith(
+        Order,
+        expect.objectContaining({
+          user_id: 'user-123',
+          seat_id: 'seat-456',
+          status: ORDER_STATUS.PENDING,
+          amount: 100,
+          currency: 'USD',
+        }),
+      );
+
+      const [, order] = mockManager.create.mock.calls[0] as [
+        unknown,
+        Partial<Order>,
+      ];
+      const ttlMs = order.expires_at!.getTime() - before;
+      expect(ttlMs).toBeGreaterThanOrEqual(TTL_MINUTES * 60 * 1000);
+      expect(ttlMs).toBeLessThan(TTL_MINUTES * 60 * 1000 + 5000);
+
+      expect(mockProcessPaymentUseCase.execute).toHaveBeenCalledWith(
+        'order-789',
+      );
+      expect(result).toEqual({
+        orderId: 'order-789',
+        checkoutUrl: 'https://checkout.stripe.com/pay/cs_test_123',
+      });
     });
 
-    it('You should successfully create a booking when the seat is available', async () => {
-        const userId = 'user-123';
-        const seatId = 'seat-456';
+    it('should keep the order and return a null checkout URL when payment fails', async () => {
+      mockManager.findOne.mockResolvedValue(buildSeat());
+      mockProcessPaymentUseCase.execute.mockRejectedValue(
+        new Error('Stripe down'),
+      );
 
-        const mockSeat: Partial<Seat> = {
-            id: seatId,
-            status: STATUS_SEATS.AVAILABLE,
-            price: 100,
-            row: 'A',
-            number: 5,
-        };
+      const result = await service.createBooking('user-123', 'seat-456');
 
-        const mockOrder: Partial<Order> = {
-            id: 'order-789',
-            user_id: userId,
-            seat: mockSeat as Seat,
-            status: ORDER_STATUS.PENDING,
-            expires_at: new Date(Date.now() + 10 * 60 * 1000),
-        };
-
-        (mockQueryRunner.manager.findOne as jest.Mock).mockResolvedValue(mockSeat);
-
-        (mockQueryRunner.manager.save as jest.Mock).mockImplementation(async (entity) => {
-            return entity;
-        });
-
-        (mockQueryRunner.manager.create as jest.Mock).mockReturnValue(mockOrder);
-
-        (mockProcessPaymentUseCase.execute as jest.Mock).mockResolvedValue({
-            paymentId: 'payment-123',
-            checkoutUrl: 'https://checkout.stripe.com/pay/cs_test_123'
-        });
-
-        const result = await service.createBooking(userId, seatId);
-
-        expect(mockDataSource.createQueryRunner).toHaveBeenCalled();
-        expect(mockQueryRunner.connect).toHaveBeenCalled();
-        expect(mockQueryRunner.startTransaction).toHaveBeenCalled();
-
-        expect(mockQueryRunner.manager.findOne).toHaveBeenCalledWith(Seat, {
-            where: { id: seatId },
-            lock: { mode: 'pessimistic_write' },
-        });
-
-        expect(mockQueryRunner.manager.save).toHaveBeenCalledWith(mockSeat);
-        expect(mockSeat.status).toBe(STATUS_SEATS.LOCKED);
-
-        expect(mockQueryRunner.manager.create).toHaveBeenCalledWith(Order, {
-            user_id: userId,
-            seat: mockSeat,
-            status: ORDER_STATUS.PENDING,
-            expires_at: expect.any(Date),
-            amount: mockSeat.price,
-            currency: 'USD',
-        });
-
-        expect(mockQueryRunner.manager.save).toHaveBeenCalledWith(mockOrder);
-
-        expect(mockQueryRunner.commitTransaction).toHaveBeenCalled();
-
-        expect(mockQueryRunner.rollbackTransaction).not.toHaveBeenCalled();
-
-        expect(mockQueryRunner.release).toHaveBeenCalled();
-        expect(result).toEqual({
-            checkoutUrl: 'https://checkout.stripe.com/pay/cs_test_123',
-            orderId: mockOrder.id
-        });
+      expect(result).toMatchObject({ orderId: 'order-789', checkoutUrl: null });
+      expect(result).toHaveProperty('message');
     });
 
-    it('You should throw a NotFoundException if the seat does not exist', async () => {
-        const userId = 'user-123';
-        const seatId = 'seat-inexistente';
+    it('should throw NotFoundException if the seat does not exist', async () => {
+      mockManager.findOne.mockResolvedValue(null);
 
-        (mockQueryRunner.manager.findOne as jest.Mock).mockResolvedValue(null);
-
-        await expect(service.createBooking(userId, seatId)).rejects.toThrow(NotFoundException);
-        await expect(service.createBooking(userId, seatId)).rejects.toThrow('Seat not found');
-
-        expect(mockQueryRunner.startTransaction).toHaveBeenCalled();
-
-        expect(mockQueryRunner.manager.findOne).toHaveBeenCalled();
-
-        expect(mockQueryRunner.manager.save).not.toHaveBeenCalled();
-
-        expect(mockQueryRunner.rollbackTransaction).toHaveBeenCalled();
-
-        expect(mockQueryRunner.commitTransaction).not.toHaveBeenCalled();
-
-        expect(mockQueryRunner.release).toHaveBeenCalled();
+      await expect(
+        service.createBooking('user-123', 'seat-missing'),
+      ).rejects.toThrow(NotFoundException);
+      expect(mockManager.save).not.toHaveBeenCalled();
+      expect(mockProcessPaymentUseCase.execute).not.toHaveBeenCalled();
     });
 
-    it('You should throw a ConflictException if the seat is not available', async () => {
-        const userId = 'user-123';
-        const seatId = 'seat-456';
+    it.each([STATUS_SEATS.LOCKED, STATUS_SEATS.SOLD])(
+      'should throw ConflictException if the seat is %s',
+      async (status) => {
+        mockManager.findOne.mockResolvedValue(buildSeat(status));
 
-        const mockSeat: Partial<Seat> = {
-            id: seatId,
-            status: STATUS_SEATS.LOCKED,
-            price: 100,
-        };
+        await expect(
+          service.createBooking('user-123', 'seat-456'),
+        ).rejects.toThrow(ConflictException);
+        expect(mockManager.save).not.toHaveBeenCalled();
+        expect(mockProcessPaymentUseCase.execute).not.toHaveBeenCalled();
+      },
+    );
 
-        (mockQueryRunner.manager.findOne as jest.Mock).mockResolvedValue(mockSeat);
+    it('should propagate database errors and not request a payment', async () => {
+      mockManager.findOne.mockResolvedValue(buildSeat());
+      mockManager.save.mockRejectedValue(new Error('Database connection lost'));
 
-        await expect(service.createBooking(userId, seatId)).rejects.toThrow(ConflictException);
-        await expect(service.createBooking(userId, seatId)).rejects.toThrow('Seat is not available');
+      await expect(
+        service.createBooking('user-123', 'seat-456'),
+      ).rejects.toThrow('Database connection lost');
+      expect(mockProcessPaymentUseCase.execute).not.toHaveBeenCalled();
+    });
+  });
 
-        expect(mockQueryRunner.manager.findOne).toHaveBeenCalled();
+  describe('findOne', () => {
+    it('should return the order', async () => {
+      const order = { id: 'order-789' };
+      mockOrderRepository.findOneBy.mockResolvedValue(order);
 
-        expect(mockQueryRunner.manager.save).not.toHaveBeenCalled();
-
-        expect(mockQueryRunner.rollbackTransaction).toHaveBeenCalled();
-
-        expect(mockQueryRunner.commitTransaction).not.toHaveBeenCalled();
-
-        expect(mockQueryRunner.release).toHaveBeenCalled();
+      await expect(service.findOne('order-789')).resolves.toBe(order);
     });
 
-    it('You should roll back if an unexpected error occurs during saving', async () => {
-        const userId = 'user-123';
-        const seatId = 'seat-456';
+    it('should throw NotFoundException when the order does not exist', async () => {
+      mockOrderRepository.findOneBy.mockResolvedValue(null);
 
-        const mockSeat: Partial<Seat> = {
-            id: seatId,
-            status: STATUS_SEATS.AVAILABLE,
-            price: 100,
-        };
-
-        (mockQueryRunner.manager.findOne as jest.Mock).mockResolvedValue(mockSeat);
-
-        const dbError = new Error('Database connection lost');
-        (mockQueryRunner.manager.save as jest.Mock).mockRejectedValue(dbError);
-
-        await expect(service.createBooking(userId, seatId)).rejects.toThrow('Database connection lost');
-
-        expect(mockQueryRunner.manager.save).toHaveBeenCalled();
-
-        expect(mockQueryRunner.rollbackTransaction).toHaveBeenCalled();
-
-        expect(mockQueryRunner.commitTransaction).not.toHaveBeenCalled();
-
-        expect(mockQueryRunner.release).toHaveBeenCalled();
+      await expect(service.findOne('missing')).rejects.toThrow(
+        'Order not found',
+      );
     });
+  });
+
+  it('findAll should list orders newest first', async () => {
+    mockOrderRepository.find.mockResolvedValue([]);
+
+    await service.findAll();
+
+    expect(mockOrderRepository.find).toHaveBeenCalledWith({
+      order: { created_at: 'DESC' },
+    });
+  });
 });

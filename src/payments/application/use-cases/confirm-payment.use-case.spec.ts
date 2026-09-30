@@ -1,107 +1,70 @@
-import { Test, TestingModule } from '@nestjs/testing';
 import { ConfirmPaymentUseCase } from './confirm-payment.use-case';
-import { NotFoundException } from '@nestjs/common';
-import type { IPaymentRepository } from 'src/payments/domain/repositories/payment.repository.interface';
-import { Payment } from 'src/payments/domain/entities/payment.entity';
+import type { IPaymentGateway } from '../ports/payment-gateway.interface';
+import type { IReservationPort } from '../ports/reservation.port';
 
 describe('ConfirmPaymentUseCase', () => {
-    let useCase: ConfirmPaymentUseCase;
-    let paymentRepository: IPaymentRepository;
+  let useCase: ConfirmPaymentUseCase;
+  let reservations: jest.Mocked<IReservationPort>;
+  let paymentGateway: jest.Mocked<IPaymentGateway>;
 
-    const mockPaymentRepository: IPaymentRepository = {
-        save: jest.fn(),
-        findById: jest.fn(),
-        findByOrderId: jest.fn(),
-        findExpiredPayments: jest.fn(),
-        cancelAndReleaseSeat: jest.fn(),
-        confirmAndFinalizeSeat: jest.fn(),
-        cancelExpiredPayment: jest.fn(),
+  beforeEach(() => {
+    reservations = {
+      findOrder: jest.fn(),
+      findExpiredPendingOrders: jest.fn(),
+      markPaid: jest.fn(),
+      release: jest.fn(),
+    };
+    paymentGateway = {
+      createCheckout: jest.fn(),
+      getCheckout: jest.fn(),
+      expireCheckout: jest.fn(),
+      refund: jest.fn(),
+      parseWebhookEvent: jest.fn(),
     };
 
-    beforeEach(async () => {
-        const module: TestingModule = await Test.createTestingModule({
-            providers: [
-                ConfirmPaymentUseCase,
-                {
-                    provide: 'IPaymentRepository',
-                    useValue: mockPaymentRepository,
-                },
-            ],
-        }).compile();
+    useCase = new ConfirmPaymentUseCase(reservations, paymentGateway);
+  });
 
-        useCase = module.get<ConfirmPaymentUseCase>(ConfirmPaymentUseCase);
-        paymentRepository = module.get<IPaymentRepository>('IPaymentRepository');
+  it('debe marcar la orden como pagada', async () => {
+    reservations.markPaid.mockResolvedValue('settled');
 
-        jest.clearAllMocks();
-    });
+    const result = await useCase.execute('order-123', 'cs_test_123');
 
-    // Should confirm payment successfully when it exists and has externalId
-    it('debe confirmar el pago exitosamente cuando existe', async () => {
-        const orderId = 'order-123';
-        const stripeSessionId = 'stripe-session-456';
+    expect(result).toBe('settled');
+    expect(reservations.markPaid).toHaveBeenCalledWith(
+      'order-123',
+      'cs_test_123',
+    );
+    expect(paymentGateway.refund).not.toHaveBeenCalled();
+  });
 
-        const mockPayment = new Payment(
-            'payment-456',
-            100,
-            'USD',
-            'PENDING',
-            orderId,
-            new Date()
-        );
+  it.each(['already_settled', 'not_found'] as const)(
+    'no debe reembolsar cuando el resultado es %s',
+    async (settlement) => {
+      reservations.markPaid.mockResolvedValue(settlement);
 
-        (mockPaymentRepository.findByOrderId as jest.Mock).mockResolvedValue(mockPayment);
-        (mockPaymentRepository.confirmAndFinalizeSeat as jest.Mock).mockResolvedValue(undefined);
+      await expect(useCase.execute('order-123', 'cs_test_123')).resolves.toBe(
+        settlement,
+      );
+      expect(paymentGateway.refund).not.toHaveBeenCalled();
+    },
+  );
 
-        const result = await useCase.execute(orderId, stripeSessionId);
+  it('debe reembolsar un pago que llega después de cancelar la orden', async () => {
+    reservations.markPaid.mockResolvedValue('conflict');
 
-        expect(mockPaymentRepository.findByOrderId).toHaveBeenCalledWith(orderId);
-        expect(mockPaymentRepository.findByOrderId).toHaveBeenCalledTimes(1);
-        expect(mockPaymentRepository.confirmAndFinalizeSeat).toHaveBeenCalledWith(orderId, stripeSessionId);
-        expect(mockPaymentRepository.confirmAndFinalizeSeat).toHaveBeenCalledTimes(1);
-        expect(result).toEqual({
-            message: 'Payment confirmed successfully',
-            orderId,
-            externalId: stripeSessionId
-        });
-    });
+    const result = await useCase.execute('order-123', 'cs_late');
 
-    // Should throw NotFoundException when payment does not exist
-    it('debe lanzar NotFoundException cuando el pago no existe', async () => {
-        const orderId = 'order-inexistente';
-        const stripeSessionId = 'stripe-session-999';
+    expect(result).toBe('conflict');
+    expect(paymentGateway.refund).toHaveBeenCalledWith('cs_late');
+  });
 
-        (mockPaymentRepository.findByOrderId as jest.Mock).mockResolvedValue(null);
+  it('debe relanzar el error si el reembolso falla, para que Stripe reintente', async () => {
+    reservations.markPaid.mockResolvedValue('conflict');
+    paymentGateway.refund.mockRejectedValue(new Error('Refund failed'));
 
-        await expect(useCase.execute(orderId, stripeSessionId)).rejects.toThrow(NotFoundException);
-        await expect(useCase.execute(orderId, stripeSessionId)).rejects.toThrow(`No se encontró un registro de pago para la orden: ${orderId}`);
-
-        expect(mockPaymentRepository.findByOrderId).toHaveBeenCalledWith(orderId);
-        expect(mockPaymentRepository.confirmAndFinalizeSeat).not.toHaveBeenCalled();
-    });
-
-
-
-    // Should rethrow error if repository fails to confirm
-    it('debe relanzar el error si el repositorio falla al confirmar', async () => {
-        const orderId = 'order-789';
-        const stripeSessionId = 'stripe-session-789';
-
-        const mockPayment = new Payment(
-            'payment-999',
-            50,
-            'USD',
-            'PENDING',
-            orderId,
-            new Date()
-        );
-
-        (mockPaymentRepository.findByOrderId as jest.Mock).mockResolvedValue(mockPayment);
-
-        const repositoryError = new Error('Database connection lost');
-        (mockPaymentRepository.confirmAndFinalizeSeat as jest.Mock).mockRejectedValue(repositoryError);
-
-        await expect(useCase.execute(orderId, stripeSessionId)).rejects.toThrow('Database connection lost');
-
-        expect(mockPaymentRepository.confirmAndFinalizeSeat).toHaveBeenCalledWith(orderId, stripeSessionId);
-    });
+    await expect(useCase.execute('order-123', 'cs_late')).rejects.toThrow(
+      'Refund failed',
+    );
+  });
 });

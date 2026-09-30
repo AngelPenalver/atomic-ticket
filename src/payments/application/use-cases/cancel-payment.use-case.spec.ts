@@ -1,60 +1,82 @@
-import { Test, TestingModule } from '@nestjs/testing';
 import { CancelPaymentUseCase } from './cancel-payment.use-case';
 import type { IPaymentRepository } from 'src/payments/domain/repositories/payment.repository.interface';
+import type { IReservationPort } from '../ports/reservation.port';
+import {
+  Payment,
+  PaymentStatus,
+} from 'src/payments/domain/entities/payment.entity';
+
+function buildPayment(externalId?: string): Payment {
+  return new Payment(
+    'payment-1',
+    100,
+    'USD',
+    PaymentStatus.PENDING,
+    'order-123',
+    new Date(),
+    externalId,
+  );
+}
 
 describe('CancelPaymentUseCase', () => {
-    let useCase: CancelPaymentUseCase;
-    let paymentRepository: IPaymentRepository;
+  let useCase: CancelPaymentUseCase;
+  let paymentRepository: jest.Mocked<IPaymentRepository>;
+  let reservations: jest.Mocked<IReservationPort>;
 
-    const mockPaymentRepository: IPaymentRepository = {
-        save: jest.fn(),
-        findById: jest.fn(),
-        findByOrderId: jest.fn(),
-        findExpiredPayments: jest.fn(),
-        cancelAndReleaseSeat: jest.fn(),
-        confirmAndFinalizeSeat: jest.fn(),
-        cancelExpiredPayment: jest.fn(),
+  beforeEach(() => {
+    paymentRepository = {
+      findByOrderId: jest.fn(),
+      createIfAbsent: jest.fn(),
+      attachExternalId: jest.fn(),
+    };
+    reservations = {
+      findOrder: jest.fn(),
+      findExpiredPendingOrders: jest.fn(),
+      markPaid: jest.fn(),
+      release: jest.fn(),
     };
 
-    beforeEach(async () => {
-        const module: TestingModule = await Test.createTestingModule({
-            providers: [
-                CancelPaymentUseCase,
-                {
-                    provide: 'IPaymentRepository',
-                    useValue: mockPaymentRepository,
-                },
-            ],
-        }).compile();
+    useCase = new CancelPaymentUseCase(paymentRepository, reservations);
+  });
 
-        useCase = module.get<CancelPaymentUseCase>(CancelPaymentUseCase);
-        paymentRepository = module.get<IPaymentRepository>('IPaymentRepository');
+  it('debe liberar la reserva cuando expira el checkout actual', async () => {
+    paymentRepository.findByOrderId.mockResolvedValue(
+      buildPayment('cs_current'),
+    );
+    reservations.release.mockResolvedValue('settled');
 
-        jest.clearAllMocks();
-    });
+    const result = await useCase.execute('order-123', 'cs_current');
 
-    // Should call repository to cancel payment and release seat
-    it('debe llamar al repositorio para cancelar el pago y liberar el asiento', async () => {
-        const orderId = 'order-123';
+    expect(result).toBe('settled');
+    expect(reservations.release).toHaveBeenCalledWith('order-123');
+  });
 
-        (mockPaymentRepository.cancelAndReleaseSeat as jest.Mock).mockResolvedValue(undefined);
+  it('debe ignorar la expiración de un checkout que no es el actual', async () => {
+    paymentRepository.findByOrderId.mockResolvedValue(
+      buildPayment('cs_current'),
+    );
 
-        await useCase.execute(orderId);
+    const result = await useCase.execute('order-123', 'cs_discarded');
 
-        expect(mockPaymentRepository.cancelAndReleaseSeat).toHaveBeenCalled();
-        expect(mockPaymentRepository.cancelAndReleaseSeat).toHaveBeenCalledTimes(1);
-        expect(mockPaymentRepository.cancelAndReleaseSeat).toHaveBeenCalledWith(orderId);
-    });
+    expect(result).toBe('stale');
+    expect(reservations.release).not.toHaveBeenCalled();
+  });
 
-    // Should rethrow error if repository fails
-    it('debe relanzar el error si el repositorio falla', async () => {
-        const orderId = 'order-456';
+  it('debe ignorar la expiración si la orden no tiene pago', async () => {
+    paymentRepository.findByOrderId.mockResolvedValue(null);
 
-        const repositoryError = new Error('Order not found in database');
-        (mockPaymentRepository.cancelAndReleaseSeat as jest.Mock).mockRejectedValue(repositoryError);
+    await expect(useCase.execute('order-123', 'cs_any')).resolves.toBe('stale');
+    expect(reservations.release).not.toHaveBeenCalled();
+  });
 
-        await expect(useCase.execute(orderId)).rejects.toThrow('Order not found in database');
+  it('debe relanzar el error si falla la liberación', async () => {
+    paymentRepository.findByOrderId.mockResolvedValue(
+      buildPayment('cs_current'),
+    );
+    reservations.release.mockRejectedValue(new Error('Database error'));
 
-        expect(mockPaymentRepository.cancelAndReleaseSeat).toHaveBeenCalledWith(orderId);
-    });
+    await expect(useCase.execute('order-123', 'cs_current')).rejects.toThrow(
+      'Database error',
+    );
+  });
 });

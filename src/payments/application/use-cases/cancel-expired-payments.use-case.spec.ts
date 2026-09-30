@@ -1,109 +1,94 @@
-import { Test, TestingModule } from '@nestjs/testing';
 import { CancelExpiredPaymentsUseCase } from './cancel-expired-payments.use-case';
-import type { IPaymentRepository } from 'src/payments/domain/repositories/payment.repository.interface';
-import { Payment } from 'src/payments/domain/entities/payment.entity';
+import type { IPaymentGateway } from '../ports/payment-gateway.interface';
+import type { IReservationPort } from '../ports/reservation.port';
 
 describe('CancelExpiredPaymentsUseCase', () => {
-    let useCase: CancelExpiredPaymentsUseCase;
-    let paymentRepository: IPaymentRepository;
+  let useCase: CancelExpiredPaymentsUseCase;
+  let reservations: jest.Mocked<IReservationPort>;
+  let paymentGateway: jest.Mocked<IPaymentGateway>;
 
-    const mockPaymentRepository: IPaymentRepository = {
-        save: jest.fn(),
-        findById: jest.fn(),
-        findByOrderId: jest.fn(),
-        findExpiredPayments: jest.fn(),
-        cancelExpiredPayment: jest.fn(),
-        cancelAndReleaseSeat: jest.fn(),
-        confirmAndFinalizeSeat: jest.fn(),
+  beforeEach(() => {
+    reservations = {
+      findOrder: jest.fn(),
+      findExpiredPendingOrders: jest.fn(),
+      markPaid: jest.fn(),
+      release: jest.fn().mockResolvedValue('settled'),
+    };
+    paymentGateway = {
+      createCheckout: jest.fn(),
+      getCheckout: jest.fn(),
+      expireCheckout: jest.fn().mockResolvedValue('expired'),
+      refund: jest.fn(),
+      parseWebhookEvent: jest.fn(),
     };
 
-    beforeEach(async () => {
-        const module: TestingModule = await Test.createTestingModule({
-            providers: [
-                CancelExpiredPaymentsUseCase,
-                {
-                    provide: 'IPaymentRepository',
-                    useValue: mockPaymentRepository,
-                },
-            ],
-        }).compile();
+    useCase = new CancelExpiredPaymentsUseCase(reservations, paymentGateway);
+  });
 
-        useCase = module.get<CancelExpiredPaymentsUseCase>(CancelExpiredPaymentsUseCase);
-        paymentRepository = module.get<IPaymentRepository>('IPaymentRepository');
+  it('debe buscar órdenes caducadas en la fecha indicada y por lotes', async () => {
+    const now = new Date('2026-09-30T12:00:00Z');
+    reservations.findExpiredPendingOrders.mockResolvedValue([]);
 
-        jest.clearAllMocks();
-    });
+    await useCase.execute(now);
 
-    // Should do nothing if there are no expired payments
-    it('debe terminar sin hacer nada si no hay pagos expirados', async () => {
-        (mockPaymentRepository.findExpiredPayments as jest.Mock).mockResolvedValue([]);
+    expect(reservations.findExpiredPendingOrders).toHaveBeenCalledWith(
+      now,
+      100,
+    );
+    expect(reservations.release).not.toHaveBeenCalled();
+  });
 
-        await useCase.execute();
+  it('debe liberar directamente las órdenes que nunca obtuvieron checkout', async () => {
+    reservations.findExpiredPendingOrders.mockResolvedValue([
+      { orderId: 'order-1' },
+    ]);
 
-        expect(mockPaymentRepository.findExpiredPayments).toHaveBeenCalledWith(expect.any(Date));
-        expect(mockPaymentRepository.findExpiredPayments).toHaveBeenCalledTimes(1);
-        expect(mockPaymentRepository.cancelExpiredPayment).not.toHaveBeenCalled();
-    });
+    await useCase.execute();
 
-    // Should cancel all expired payments successfully
-    it('debe cancelar todos los pagos expirados exitosamente', async () => {
-        const expiredPayments = [
-            new Payment('payment-1', 100, 'USD', 'PENDING', 'order-1', new Date()),
-            new Payment('payment-2', 200, 'USD', 'PENDING', 'order-2', new Date()),
-            new Payment('payment-3', 300, 'USD', 'PENDING', 'order-3', new Date()),
-        ];
+    expect(paymentGateway.expireCheckout).not.toHaveBeenCalled();
+    expect(reservations.release).toHaveBeenCalledWith('order-1');
+  });
 
-        (mockPaymentRepository.findExpiredPayments as jest.Mock).mockResolvedValue(expiredPayments);
-        (mockPaymentRepository.cancelExpiredPayment as jest.Mock).mockResolvedValue(undefined);
+  it('debe cerrar el checkout antes de liberar la orden', async () => {
+    reservations.findExpiredPendingOrders.mockResolvedValue([
+      { orderId: 'order-1', externalId: 'cs_1' },
+    ]);
 
-        await useCase.execute();
+    await useCase.execute();
 
-        expect(mockPaymentRepository.findExpiredPayments).toHaveBeenCalledTimes(1);
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledTimes(3);
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledWith('order-1');
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledWith('order-2');
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledWith('order-3');
-    });
+    expect(paymentGateway.expireCheckout).toHaveBeenCalledWith('cs_1');
+    expect(reservations.release).toHaveBeenCalledWith('order-1');
+    expect(
+      paymentGateway.expireCheckout.mock.invocationCallOrder[0],
+    ).toBeLessThan(reservations.release.mock.invocationCallOrder[0]);
+  });
 
-    // Should continue canceling other payments even if one fails
-    it('debe continuar cancelando otros pagos aunque uno falle', async () => {
-        const expiredPayments = [
-            new Payment('payment-1', 100, 'USD', 'PENDING', 'order-1', new Date()),
-            new Payment('payment-2', 200, 'USD', 'PENDING', 'order-2', new Date()),
-            new Payment('payment-3', 300, 'USD', 'PENDING', 'order-3', new Date()),
-        ];
+  it('debe confirmar en lugar de liberar si el checkout se pagó en el último momento', async () => {
+    reservations.findExpiredPendingOrders.mockResolvedValue([
+      { orderId: 'order-1', externalId: 'cs_1' },
+    ]);
+    paymentGateway.expireCheckout.mockResolvedValue('completed');
 
-        (mockPaymentRepository.findExpiredPayments as jest.Mock).mockResolvedValue(expiredPayments);
+    await useCase.execute();
 
-        (mockPaymentRepository.cancelExpiredPayment as jest.Mock)
-            .mockResolvedValueOnce(undefined)
-            .mockRejectedValueOnce(new Error('Database error'))
-            .mockResolvedValueOnce(undefined);
+    expect(reservations.markPaid).toHaveBeenCalledWith('order-1', 'cs_1');
+    expect(reservations.release).not.toHaveBeenCalled();
+  });
 
-        await useCase.execute();
+  it('debe continuar con las demás órdenes aunque una falle', async () => {
+    reservations.findExpiredPendingOrders.mockResolvedValue([
+      { orderId: 'order-1', externalId: 'cs_1' },
+      { orderId: 'order-2', externalId: 'cs_2' },
+      { orderId: 'order-3' },
+    ]);
+    paymentGateway.expireCheckout
+      .mockRejectedValueOnce(new Error('Stripe down'))
+      .mockResolvedValueOnce('expired');
 
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledTimes(3);
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledWith('order-1');
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledWith('order-2');
-        expect(mockPaymentRepository.cancelExpiredPayment).toHaveBeenCalledWith('order-3');
-    });
+    await expect(useCase.execute()).resolves.toBeUndefined();
 
-    // Should search for payments with expiration time of 10 minutes ago
-    it('debe buscar pagos con fecha de expiración de 10 minutos atrás', async () => {
-        (mockPaymentRepository.findExpiredPayments as jest.Mock).mockResolvedValue([]);
-
-        const beforeExecute = new Date();
-
-        await useCase.execute();
-
-        expect(mockPaymentRepository.findExpiredPayments).toHaveBeenCalled();
-
-        const callArgs = (mockPaymentRepository.findExpiredPayments as jest.Mock).mock.calls[0][0];
-        const expirationDate = callArgs as Date;
-
-        const tenMinutesAgo = new Date(beforeExecute.getTime() - 10 * 60 * 1000);
-
-        const timeDifference = Math.abs(expirationDate.getTime() - tenMinutesAgo.getTime());
-        expect(timeDifference).toBeLessThan(1000);
-    });
+    expect(reservations.release).not.toHaveBeenCalledWith('order-1');
+    expect(reservations.release).toHaveBeenCalledWith('order-2');
+    expect(reservations.release).toHaveBeenCalledWith('order-3');
+  });
 });
