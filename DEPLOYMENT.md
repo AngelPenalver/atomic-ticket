@@ -34,7 +34,8 @@ gcloud services enable \
   run.googleapis.com \
   sqladmin.googleapis.com \
   secretmanager.googleapis.com \
-  artifactregistry.googleapis.com
+  artifactregistry.googleapis.com \
+  cloudscheduler.googleapis.com
 ```
 
 ### Paso 2: Crear Base de Datos (Cloud SQL)
@@ -42,7 +43,7 @@ gcloud services enable \
 ```bash
 # Crear instancia PostgreSQL
 gcloud sql instances create atomic-ticket-db \
-  --database-version=POSTGRES_15 \
+  --database-version=POSTGRES_17 \
   --tier=db-f1-micro \
   --region=us-central1 \
   --root-password=TU_PASSWORD_SEGURO
@@ -68,17 +69,36 @@ echo -n "sk_test_tu_clave" | \
 echo -n "whsec_tu_secret" | \
   gcloud secrets create stripe-webhook-secret --data-file=-
 
-# Database URL
+# Database URL (socket de Cloud SQL)
 echo -n "postgresql://appuser:password@/atomic_ticket?host=/cloudsql/TU_PROJECT_ID:us-central1:atomic-ticket-db" | \
   gcloud secrets create database-url --data-file=-
+
+# API key para endpoints de administración (crear eventos, listar órdenes, expirar reservas)
+openssl rand -hex 32 | tr -d '\n' | \
+  gcloud secrets create admin-api-key --data-file=-
 ```
+
+Dar acceso a los secrets a la cuenta de servicio de Cloud Run:
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe TU_PROJECT_ID --format='value(projectNumber)')
+for secret in stripe-secret-key stripe-webhook-secret database-url admin-api-key; do
+  gcloud secrets add-iam-policy-binding $secret \
+    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+    --role="roles/secretmanager.secretAccessor"
+done
+```
+
+> El esquema de base de datos se crea con migraciones que se ejecutan automáticamente al arrancar la aplicación. No hace falta ningún paso manual.
 
 ### Paso 4: Deploy
 
 ```bash
 # Ejecutar script de deployment
-./deploy.sh TU_PROJECT_ID us-central1
+./deploy.sh TU_PROJECT_ID https://tu-frontend.com us-central1 atomic-ticket-db
 ```
+
+El script comprueba que existan los secrets, construye la imagen etiquetada con el commit actual y despliega con Cloud SQL, secrets y variables de entorno.
 
 ---
 
@@ -100,22 +120,23 @@ gcloud artifacts repositories create atomic-ticket \
 gcloud auth configure-docker ${REGION}-docker.pkg.dev
 
 # Build
-docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/atomic-ticket/app:latest .
+export TAG=$(git rev-parse --short HEAD)
+docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/atomic-ticket/app:${TAG} .
 
 # Push
-docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/atomic-ticket/app:latest
+docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/atomic-ticket/app:${TAG}
 ```
 
 ### Deploy a Cloud Run
 
 ```bash
 gcloud run deploy atomic-ticket \
-  --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/atomic-ticket/app:latest \
+  --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/atomic-ticket/app:${TAG} \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \
   --add-cloudsql-instances ${PROJECT_ID}:${REGION}:atomic-ticket-db \
-  --set-secrets="STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,DATABASE_URL=database-url:latest" \
+  --set-secrets="STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,DATABASE_URL=database-url:latest,ADMIN_API_KEY=admin-api-key:latest" \
   --set-env-vars="NODE_ENV=production,FRONTEND_URL=https://tu-frontend.com" \
   --port 8080 \
   --memory 512Mi \
@@ -142,12 +163,31 @@ gcloud run services describe atomic-ticket \
 1. Ir a: https://dashboard.stripe.com/webhooks
 2. Click "Add endpoint"
 3. URL: `https://tu-cloud-run-url/api/v1/webhooks/stripe`
-4. Eventos: `checkout.session.completed`, `checkout.session.expired`
+4. Eventos: `checkout.session.completed`, `checkout.session.expired`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`
 5. Copiar el signing secret y actualizar:
    ```bash
    echo -n "whsec_nuevo_secret" | \
      gcloud secrets versions add stripe-webhook-secret --data-file=-
    ```
+
+---
+
+## Expiración de Reservas (Cloud Scheduler)
+
+Con `--min-instances 0`, Cloud Run no ejecuta el cron interno mientras no hay tráfico. Para liberar los asientos a tiempo, Cloud Scheduler llama cada minuto al endpoint de expiración:
+
+```bash
+SERVICE_URL=$(gcloud run services describe atomic-ticket --region us-central1 --format 'value(status.url)')
+
+gcloud scheduler jobs create http atomic-ticket-expire-reservations \
+  --location us-central1 \
+  --schedule "* * * * *" \
+  --http-method POST \
+  --uri "${SERVICE_URL}/api/v1/payments/expire-reservations" \
+  --headers "x-api-key=$(gcloud secrets versions access latest --secret=admin-api-key)"
+```
+
+Como red de seguridad, cada sesión de Stripe caduca sola a los ~30 minutos (el mínimo que permite Stripe) y el webhook `checkout.session.expired` libera el asiento aunque el job no se haya ejecutado.
 
 ---
 
@@ -164,7 +204,16 @@ FRONTEND_URL=https://tu-frontend.com
 STRIPE_SECRET_KEY=<secret>
 STRIPE_WEBHOOK_SECRET=<secret>
 DATABASE_URL=<secret>
+ADMIN_API_KEY=<secret>
 ```
+
+### Opcionales
+
+```bash
+RESERVATION_TTL_MINUTES=15  # Minutos que un asiento queda bloqueado esperando el pago
+```
+
+La aplicación valida todas las variables al arrancar y no inicia si falta alguna o tiene un valor inválido.
 
 ### Actualizar Variables
 
@@ -216,12 +265,12 @@ SERVICE_URL=$(gcloud run services describe atomic-ticket \
   --region us-central1 \
   --format 'value(status.url)')
 
-# Test básico
-curl $SERVICE_URL/api/v1/events
+ADMIN_API_KEY=$(gcloud secrets versions access latest --secret=admin-api-key)
 
 # Crear evento de prueba
 curl -X POST $SERVICE_URL/api/v1/events \
   -H "Content-Type: application/json" \
+  -H "x-api-key: $ADMIN_API_KEY" \
   -d '{
     "name": "Test Event",
     "description": "Testing deployment",
@@ -261,6 +310,7 @@ Con el free tier de Google Cloud ($300 por 90 días):
 - **Cloud SQL (db-f1-micro)**: ~$7-10/mes
 - **Artifact Registry**: 0.5 GB gratis/mes
 - **Secret Manager**: Gratis hasta 6 secrets
+- **Cloud Scheduler**: Gratis hasta 3 jobs
 
 **Total estimado: $7-10/mes** (después del free tier)
 
@@ -300,9 +350,12 @@ gcloud secrets list
 ### Deployment Automático
 
 ```bash
-# Deploy usando Cloud Build
-gcloud builds submit --config cloudbuild.yaml
+# Deploy usando Cloud Build (typecheck + lint + tests + build + deploy)
+gcloud builds submit --config cloudbuild.yaml \
+  --substitutions=SHORT_SHA=$(git rev-parse --short HEAD),_FRONTEND_URL=https://tu-frontend.com
 ```
+
+La cuenta de servicio de Cloud Build necesita los roles `roles/run.admin` y `roles/iam.serviceAccountUser`.
 
 ### Trigger Automático desde GitHub
 

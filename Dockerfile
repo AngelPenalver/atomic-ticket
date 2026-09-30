@@ -1,39 +1,25 @@
-# Build stage
-FROM node:18-alpine AS builder
+# syntax=docker/dockerfile:1
 
+FROM node:22-alpine AS base
 WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
-# Copiar archivos de dependencias
-COPY package.json pnpm-lock.yaml ./
-
-# Instalar pnpm y dependencias
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
-
-# Copiar código fuente
+# Build stage: full dependency set to compile TypeScript
+FROM base AS builder
+RUN pnpm install --frozen-lockfile
 COPY . .
-
-# Build de la aplicación
 RUN pnpm run build
 
-# Production stage
-FROM node:18-alpine
-
-WORKDIR /app
-
-# Copiar archivos de dependencias
-COPY package.json pnpm-lock.yaml ./
-
-# Instalar TODAS las dependencias (no solo prod)
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
-
-# Copiar el build desde el stage anterior
+# Runtime stage: production dependencies only
+FROM base AS runtime
+ENV NODE_ENV=production
+RUN pnpm install --frozen-lockfile --prod && pnpm store prune
 COPY --from=builder /app/dist ./dist
 
-# Exponer puerto (Cloud Run usa PORT env var)
+# Cloud Run injects PORT (8080 by default)
 EXPOSE 8080
-
-# Usuario no-root por seguridad
 USER node
 
-# Comando de inicio
+# Pending migrations run automatically on startup (migrationsRun: true)
 CMD ["node", "dist/main"]
