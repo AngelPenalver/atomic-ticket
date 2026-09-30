@@ -1,5 +1,7 @@
 # Atomic Ticket - Sistema de Reservas con Stripe
 
+[![CI](https://github.com/AngelPenalver/atomic-ticket/actions/workflows/ci.yml/badge.svg)](https://github.com/AngelPenalver/atomic-ticket/actions/workflows/ci.yml)
+
 Sistema de reservas de tickets con control de concurrencia y pagos mediante Stripe.
 
 ## Características
@@ -7,8 +9,10 @@ Sistema de reservas de tickets con control de concurrencia y pagos mediante Stri
 - Control de Concurrencia: Solo un usuario puede reservar un asiento específico
 - Pagos con Stripe: Integración completa con Stripe Checkout
 - Webhooks: Confirmación automática de pagos
-- Expiración Automática: Pagos pendientes se cancelan después de 15 minutos
+- Expiración Automática: Las reservas sin pagar se liberan tras `RESERVATION_TTL_MINUTES` (15 por defecto)
 - Transacciones: Garantía de consistencia en la base de datos
+- Idempotencia: Webhooks duplicados o tardíos no pueden vender un asiento dos veces (un pago tardío se reembolsa)
+- Migraciones: El esquema se versiona con migraciones de TypeORM
 
 ---
 
@@ -16,7 +20,8 @@ Sistema de reservas de tickets con control de concurrencia y pagos mediante Stri
 
 ### 1. Requisitos Previos
 
-- Node.js 18+
+- Node.js 22+
+- pnpm (`corepack enable`)
 - Docker y Docker Compose
 - Cuenta de Stripe (modo test)
 - Stripe CLI (opcional, para webhooks locales)
@@ -31,12 +36,14 @@ cd atomic-ticket
 # Instalar dependencias
 pnpm install
 
-# Levantar base de datos con Docker
-docker-compose up -d
-
 # Copiar variables de entorno
 cp .env.example .env
+
+# Levantar base de datos con Docker
+docker compose up -d
 ```
+
+> Si tenías una base de datos creada con la versión anterior (`synchronize: true`), recréala con `docker compose down -v && docker compose up -d`: las migraciones esperan una base de datos vacía.
 
 ### 3. Configurar Stripe
 
@@ -51,7 +58,12 @@ STRIPE_WEBHOOK_SECRET=whsec_tu_secret_aqui
 
 # URL del frontend (para redirecciones de Stripe)
 FRONTEND_URL=http://localhost:3000
+
+# API key para endpoints de administración (mínimo 16 caracteres)
+ADMIN_API_KEY=una-clave-larga-y-aleatoria
 ```
+
+La aplicación valida las variables al arrancar y no inicia si falta alguna.
 
 ### 4. Iniciar Aplicación
 
@@ -60,6 +72,17 @@ FRONTEND_URL=http://localhost:3000
 pnpm run start:dev
 
 # La API estará disponible en: http://localhost:3000/api/v1
+```
+
+Las migraciones pendientes se aplican automáticamente al arrancar. Para cambiar el esquema:
+
+```bash
+# Tras modificar una entidad, generar la migración
+pnpm migration:generate src/database/migrations/NombreDelCambio
+
+# Aplicar / revertir manualmente
+pnpm migration:run
+pnpm migration:revert
 ```
 
 ### 5. Verificar Base de Datos
@@ -81,6 +104,7 @@ Accede a Adminer en: http://localhost:8080
 ```bash
 curl -X POST http://localhost:3000/api/v1/events \
   -H "Content-Type: application/json" \
+  -H "x-api-key: $ADMIN_API_KEY" \
   -d '{
     "name": "Concierto de Rock",
     "description": "Evento de prueba",
@@ -106,17 +130,11 @@ curl -X POST http://localhost:3000/api/v1/events \
 
 ### Paso 2: Obtener ID de un Asiento
 
-Consulta en Adminer o usando psql:
-
-```sql
-SELECT id, number, status 
-FROM seat 
-WHERE event_id = 'TU_EVENT_ID' 
-AND status = 'available' 
-LIMIT 1;
+```bash
+curl http://localhost:3000/api/v1/seats/event/TU_EVENT_ID
 ```
 
-Guarda el `id` del asiento para el siguiente paso.
+Guarda el `id` de un asiento con `"status": "available"` para el siguiente paso.
 
 ---
 
@@ -135,7 +153,7 @@ curl -X POST http://localhost:3000/api/v1/orders/SEAT_ID/book \
 ```bash
 curl -X POST http://localhost:3000/api/v1/orders/SEAT_ID/book \
   -H "Content-Type: application/json" \
-  -d '{}' &
+  -d '{"user_id": "3f1c2d5e-1111-4a2b-9c3d-123456789abc"}' &
 ```
 
 > **Nota**: Reemplaza `SEAT_ID` con el UUID del asiento que obtuviste.
@@ -184,9 +202,10 @@ curl -X POST http://localhost:3000/api/v1/orders/SEAT_ID/book \
 
 4. **Verificar en logs**: Deberías ver en la consola del servidor:
    ```
-   [NestApplication] Payment confirmed for order: order-uuid
-   [NestApplication] Order order-uuid confirmed and seat finalized.
+   [ConfirmPaymentUseCase] Order order-uuid paid (checkout cs_test_...); seat sold
    ```
+
+   > `stripe trigger` crea una sesión propia sin `orderId` en los metadatos, así que solo sirve para comprobar que el webhook llega (se registra y se ignora). Para probar el flujo completo usa la opción B.
 
 #### Opción B: Usando el Checkout de Stripe
 
@@ -225,9 +244,9 @@ SELECT * FROM seat;
 
 ---
 
-## Probar Expiración de Pagos
+## Probar Expiración de Reservas
 
-Los pagos pendientes se cancelan automáticamente después de 15 minutos.
+Las reservas sin pagar se liberan cuando pasan `RESERVATION_TTL_MINUTES` (15 por defecto). Un cron revisa cada minuto las órdenes caducadas: primero cierra la sesión de Stripe (así ya no se puede pagar) y después cancela la orden y libera el asiento.
 
 ### Prueba Manual
 
@@ -238,7 +257,7 @@ Los pagos pendientes se cancelan automáticamente después de 15 minutos.
      -d '{}'
    ```
 
-2. **Esperar 15 minutos** (o modificar temporalmente el tiempo en `payment-cleanup.cron.ts`)
+2. **Esperar a que caduque** (para probar rápido, arranca con `RESERVATION_TTL_MINUTES=1`)
 
 3. **Verificar en la base de datos**:
    ```sql
@@ -259,14 +278,20 @@ pnpm test payments
 
 # Test con coverage
 pnpm test:cov
+
+# Comprobación de tipos y lint
+pnpm typecheck
+pnpm lint:check
 ```
 
 ---
 
 ## Endpoints Disponibles
 
+Los endpoints marcados con 🔒 requieren la cabecera `x-api-key: <ADMIN_API_KEY>`.
+
 ### Eventos
-- `POST /api/v1/events` - Crear evento con asientos
+- 🔒 `POST /api/v1/events` - Crear evento con asientos
 
 ### Asientos
 - `GET /api/v1/seats/event/:event_id` - Obtener todos los asientos de un evento
@@ -276,12 +301,14 @@ pnpm test:cov
 - `POST /api/v1/orders/:seat_id/book` - Reservar asiento
   - Body (opcional): `{ "user_id": "uuid" }`
   - Si no se proporciona `user_id`, se genera uno aleatorio
-- `GET /api/v1/orders` - Listar todas las órdenes
+- 🔒 `GET /api/v1/orders` - Listar todas las órdenes
 - `GET /api/v1/orders/:order_id` - Obtener detalle de una orden
 
 ### Pagos
-- `POST /api/v1/payments/process` - Procesar pago manualmente
+- `POST /api/v1/payments/process` - Obtener (o reintentar) el enlace de pago de una orden pendiente
   - Body: `{ "orderId": "uuid" }`
+  - Si la orden ya tiene una sesión de Stripe abierta, devuelve la misma URL: nunca hay dos checkouts pagables para una orden
+- 🔒 `POST /api/v1/payments/expire-reservations` - Liberar reservas caducadas (para Cloud Scheduler)
 
 ### Webhooks
 - `POST /api/v1/webhooks/stripe` - Webhook de Stripe (uso interno)
@@ -290,13 +317,20 @@ pnpm test:cov
 
 ## Troubleshooting
 
-### Error: "Seat is already locked"
-- **Causa**: Otro usuario ya reservó el asiento
+### Error: "Seat is not available"
+- **Causa**: Otro usuario ya reservó o compró el asiento
 - **Solución**: Intentar con otro asiento disponible
 
-### Error: "This order is already paid"
+### Error: "Order ... is already paid"
 - **Causa**: Intentando pagar una orden ya confirmada
+
+### Error: "Order ... has expired or was cancelled"
+- **Causa**: La reserva caducó antes de pagarse
 - **Solución**: Crear una nueva reserva
+
+### Error: "Invalid environment configuration"
+- **Causa**: Falta una variable de entorno obligatoria o tiene un valor inválido
+- **Solución**: Revisar `.env` contra `.env.example`
 
 ### Webhook no funciona
 - **Causa**: `STRIPE_WEBHOOK_SECRET` incorrecto o no configurado
@@ -318,13 +352,13 @@ PORT=3001
 
 ## Notas Importantes
 
-1. **UUIDs Aleatorios**: Si no proporcionas `user_id` en el body, el sistema genera uno automáticamente para facilitar las pruebas.
+1. **UUIDs Aleatorios**: Si no proporcionas `user_id` en el body, el sistema genera uno automáticamente para facilitar las pruebas. No hay autenticación de usuarios finales: `user_id` es un dato informativo.
 
-2. **Concurrencia**: El sistema usa bloqueo pesimista (`SELECT FOR UPDATE`) para garantizar que solo un usuario pueda reservar un asiento.
+2. **Concurrencia**: El sistema usa bloqueo pesimista (`SELECT FOR UPDATE`) sobre el asiento al reservar y sobre la orden al confirmar o cancelar. Las transiciones solo se aplican si la orden sigue `pending`, así que webhooks duplicados, tardíos o simultáneos con la expiración no pueden dejar estados inconsistentes.
 
-3. **Stripe Test Mode**: Asegúrate de usar claves de **test** (empiezan con `sk_test_`), no claves de producción.
+3. **Pagos tardíos**: Si llega un pago para una orden que ya se canceló, se reembolsa automáticamente.
 
-4. **Expiración**: Los pagos pendientes se cancelan automáticamente cada 15 minutos mediante un cron job.
+4. **Stripe Test Mode**: Asegúrate de usar claves de **test** (empiezan con `sk_test_`), no claves de producción.
 
 ---
 
@@ -335,13 +369,18 @@ src/
 ├── events/          # Gestión de eventos
 ├── seats/           # Gestión de asientos
 ├── orders/          # Lógica de reservas (con transacciones)
-├── payments/        # Integración con Stripe
-│   ├── application/ # Use cases
-│   ├── domain/      # Entidades y schedulers
+├── payments/        # Integración con Stripe (arquitectura hexagonal)
+│   ├── domain/      # Entidad Payment, errores y contrato del repositorio
+│   ├── application/ # Casos de uso y puertos (pasarela de pago, reservas)
 │   └── infrastructure/
-│       ├── controllers/  # Webhooks
+│       ├── controllers/  # Pagos y webhooks
+│       ├── filters/      # Errores de dominio -> HTTP
 │       ├── gateways/     # StripeAdapter
-│       └── persistence/  # Repositorios
+│       ├── persistence/  # Repositorios TypeORM
+│       └── schedulers/   # Cron de expiración
+├── common/          # Guard de API key, transformers
+├── config/          # Validación de variables de entorno
+└── database/        # Opciones de conexión, data source del CLI y migraciones
 ```
 
 ---
