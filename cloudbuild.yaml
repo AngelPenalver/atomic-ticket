@@ -1,34 +1,49 @@
+# Manual run: gcloud builds submit --config cloudbuild.yaml \
+#   --substitutions=SHORT_SHA=$(git rev-parse --short HEAD),_FRONTEND_URL=https://tu-frontend.com
+substitutions:
+  _REGION: us-central1
+  _SERVICE: atomic-ticket
+  _SQL_INSTANCE: atomic-ticket-db
+  _FRONTEND_URL: https://tu-frontend.com
+
 steps:
-  # Build la imagen Docker
-  - name: 'gcr.io/cloud-builders/docker'
-    args: 
-      - 'build'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:$SHORT_SHA'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:latest'
-      - '.'
-  
-  # Push la imagen a Artifact Registry
-  - name: 'gcr.io/cloud-builders/docker'
-    args: 
-      - 'push'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:$SHORT_SHA'
-  
-  - name: 'gcr.io/cloud-builders/docker'
-    args: 
-      - 'push'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:latest'
-  
-  # Deploy a Cloud Run
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  # Type-check, lint and test before building anything
+  - id: verify
+    name: 'node:22-alpine'
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        corepack enable
+        pnpm install --frozen-lockfile
+        pnpm typecheck
+        pnpm lint:check
+        pnpm test
+
+  - id: build
+    name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -t
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:$SHORT_SHA'
+      - -t
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:latest'
+      - .
+
+  # Pushed before deploying: the `images` field only pushes once all steps finish
+  - id: push
+    name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app']
+
+  - id: deploy
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
-      - 'run'
-      - 'deploy'
-      - 'atomic-ticket'
-      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:$SHORT_SHA'
-      - '--region=us-central1'
+      - run
+      - deploy
+      - '${_SERVICE}'
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:$SHORT_SHA'
+      - '--region=${_REGION}'
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--port=8080'
@@ -36,10 +51,9 @@ steps:
       - '--cpu=1'
       - '--min-instances=0'
       - '--max-instances=10'
-
-images:
-  - 'us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:$SHORT_SHA'
-  - 'us-central1-docker.pkg.dev/$PROJECT_ID/atomic-ticket/app:latest'
+      - '--add-cloudsql-instances=$PROJECT_ID:${_REGION}:${_SQL_INSTANCE}'
+      - '--set-secrets=STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,DATABASE_URL=database-url:latest,ADMIN_API_KEY=admin-api-key:latest'
+      - '--set-env-vars=NODE_ENV=production,FRONTEND_URL=${_FRONTEND_URL}'
 
 options:
   logging: CLOUD_LOGGING_ONLY

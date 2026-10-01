@@ -1,32 +1,39 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ScheduleModule } from '@nestjs/schedule';
 import { EventsModule } from './events/events.module';
 import { SeatsModule } from './seats/seats.module';
 import { OrdersModule } from './orders/orders.module';
 import { PaymentsModule } from './payments/payments.module';
-import { ScheduleModule } from '@nestjs/schedule';
+import { validateEnv } from './config/env.validation';
+import { buildDatabaseOptions } from './database/database.options';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      validate: validateEnv,
     }),
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: process.env.POSTGRES_HOST,
-      port: Number(process.env.POSTGRES_PORT),
-      username: process.env.POSTGRES_USER,
-      password: process.env.POSTGRES_PASSWORD,
-      database: process.env.POSTGRES_DB,
-      autoLoadEntities: true,
-      synchronize: true,
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        ...buildDatabaseOptions({
+          DATABASE_URL: config.get<string>('DATABASE_URL'),
+          POSTGRES_HOST: config.get<string>('POSTGRES_HOST'),
+          POSTGRES_PORT: config.get<number>('POSTGRES_PORT'),
+          POSTGRES_USER: config.get<string>('POSTGRES_USER'),
+          POSTGRES_PASSWORD: config.get<string>('POSTGRES_PASSWORD'),
+          POSTGRES_DB: config.get<string>('POSTGRES_DB'),
+        }),
+        autoLoadEntities: true,
+      }),
     }),
+    ScheduleModule.forRoot(),
     EventsModule,
     SeatsModule,
     OrdersModule,
     PaymentsModule,
-    ScheduleModule.forRoot()
   ],
 })
-export class AppModule { }
+export class AppModule {}

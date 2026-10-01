@@ -11,4 +11,4 @@ import { EventsModule } from 'src/events/events.module';
   providers: [SeatsService],
   exports: [SeatsService],
 })
-export class SeatsModule { }
+export class SeatsModule {}

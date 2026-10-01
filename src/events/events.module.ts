@@ -10,4 +10,4 @@ import { Event } from './entities/event.entity';
   providers: [EventsService],
   exports: [EventsService],
 })
-export class EventsModule { }
+export class EventsModule {}
